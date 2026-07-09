@@ -1,0 +1,10 @@
+# Never commit anything with real secrets a user fills in from this kit.
+config.env
+design-secret.txt
+design-url.txt
+*credential*
+*.credentials.json
+auth.db
+*.tgz
+__pycache__/
+*.pyc

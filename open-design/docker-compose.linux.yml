@@ -1,0 +1,64 @@
+# Linux override for running open-design against npm-installed Claude Code (and,
+# optionally, npm-installed Codex CLI for GPT image generation).
+#
+# Upstream deploy/docker-compose.linux.yml assumes the NATIVE Claude Code install
+# (~/.local/bin/claude + ~/.local/share/claude). Here Claude Code is npm-installed:
+#   /usr/bin/claude -> /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe
+# (a real glibc ELF binary). So we mount THAT binary and an isolated copy of the
+# subscription creds instead.
+#
+# Codex CLI is mounted too (musl-static binary + isolated ChatGPT-subscription
+# login copy) so the media pipeline can render GPT Image (codex-gpt-image-2)
+# through the ChatGPT subscription with no OpenAI API key. The design engine stays
+# Claude; only image generation shells out to codex. The Codex mounts are optional:
+# if you did not set up Codex (see setup-open-design.sh --with-codex), open-design
+# still runs — only GPT-image generation is unavailable.
+#
+# Apply with:
+#   HOME=/root docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d --no-build
+name: open-design
+services:
+  open-design:
+    # Cap CPU so a busy agent run does not starve the panel.
+    cpus: '1.5'
+    # Drop the bridge port mapping — host networking makes it irrelevant.
+    ports: !reset []
+    network_mode: host
+    environment:
+      OD_PORT: ${OPEN_DESIGN_PORT:-7456}
+      OD_WEB_PORT: ${OPEN_DESIGN_PORT:-7456}
+      # Bind to loopback only; Caddy is the only thing that reaches it.
+      OD_BIND_HOST: 127.0.0.1
+      HOME: /home/open-design
+      # Host claude launcher first on PATH so the daemon spawns the subscription CLI.
+      PATH: /mnt/host-claude-bin:/usr/local/bin:/usr/bin:/bin
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Codex CLI for GPT Image generation via ChatGPT subscription (no API key).
+      # Media pipeline spawns this directly (codex-gpt-image-2 model).
+      CODEX_BIN: /mnt/host-codex-bin/codex
+      CODEX_HOME: /home/open-design/.codex
+    volumes:
+      # 'claude' launcher (symlink -> the real npm binary), first on PATH.
+      - /opt/od-claude-bin:/mnt/host-claude-bin:ro
+      # The Claude Code package at its real absolute path so the binary + resources resolve.
+      - /usr/lib/node_modules/@anthropic-ai/claude-code:/usr/lib/node_modules/@anthropic-ai/claude-code:ro
+      # Isolated copy of the subscription creds (uid 1001), rw so claude can refresh
+      # its own copy. /root/.claude (the panel's live login) is never mounted or touched.
+      - /opt/od-claude-home:/home/open-design/.claude:rw
+      # --- Codex / GPT image generation (optional; created by setup-open-design.sh --with-codex) ---
+      # Codex CLI native binary (musl-static — runs on Alpine without glibc). Read-only.
+      - /usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin:/mnt/host-codex-bin:ro
+      # Isolated copy of the Codex ChatGPT-subscription login (uid 1001, rw). /root/.codex untouched.
+      - /opt/od-codex-home:/home/open-design/.codex:rw
+      # Full glibc for the glibc-linked claude binary on Alpine musl.
+      - /lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:ro
+      - /lib64:/lib64:ro
+    tmpfs:
+      # Writable HOME (base image rootfs is read_only). uid/gid match the image user.
+      - /home/open-design:uid=1001,gid=1001
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:${OPEN_DESIGN_PORT:-7456}/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
