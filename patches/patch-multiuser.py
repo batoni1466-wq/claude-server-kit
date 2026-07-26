@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # Patch CloudCLI (@cloudcli-ai/cloudcli 1.36.0) into a per-user jailed multi-user
 # panel. Each web user "<username>" is confined to JAIL=<WORKSPACES_ROOT>/<username>
-# (set WORKSPACES_ROOT=/srv/cloudcli-users in the server env). Server-side enforcement
-# at every projectId / path / cwd input point. Idempotent, keeps .orig backups,
+# (set WORKSPACES_ROOT=/srv/cloudcli-users in the server env). The jail is created with
+# mode 0700, so no other account on the machine can read a person's files. Server-side
+# enforcement at every projectId / path / cwd input point. Idempotent, keeps .orig backups,
 # fails loudly if an anchor is missing.
 # Usage: python3 patch-multiuser.py [INSTALL_DIR]
 #   default INSTALL_DIR = /usr/lib/node_modules/@cloudcli-ai/cloudcli
@@ -15,6 +16,14 @@ modified = []
 
 
 def patch(rel, repls):
+    """Apply (old, new, expect[, mark]) replacements to <SRV>/<rel>.
+
+    mark is the proof that a replacement is already in place. It defaults to the whole new
+    text, which is exact but brittle: the day we edit our own replacement, a panel patched
+    by the earlier version matches neither the upstream anchor nor the new text, and the
+    installer aborts on every already-running server. Where a replacement is expected to
+    keep evolving, pass a short line of ours that stays the same across versions.
+    """
     path = os.path.join(SRV, rel)
     if not os.path.exists(path):
         raise SystemExit(f"FAIL: file missing: {path}")
@@ -22,9 +31,11 @@ def patch(rel, repls):
         s = f.read()
     orig = s
     report.append(f"== {rel}")
-    for old, new, expect in repls:
-        # Idempotency: if the fully-patched text is already present, skip.
-        if new and new in s:
+    for repl in repls:
+        old, new, expect = repl[0], repl[1], repl[2]
+        mark = repl[3] if len(repl) > 3 else new
+        # Idempotency: if our text is already there, skip.
+        if mark and mark in s:
             report.append(f"  skip (already applied): {old[:50]!r}")
             continue
         c = s.count(old)
@@ -47,6 +58,32 @@ def patch(rel, repls):
         modified.append(rel)
     else:
         report.append(f"  no change {rel}")
+
+
+def upgrade(rel, old, new):
+    """Replace text that an EARLIER version of this patcher wrote.
+
+    patch() anchors on pristine upstream code. As soon as one of our own replacements
+    changes, a panel patched by the previous version holds neither the upstream anchor nor
+    the new text, and patch() would abort - so re-running install.sh after such an edit
+    would fail on every already-running server. This lifts that one piece to the current
+    text first. No-op on a fresh package and on an already current file; loud on anything
+    unexpected. Call it before patch() on the same file.
+    """
+    path = os.path.join(SRV, rel)
+    if not os.path.exists(path):
+        raise SystemExit(f"FAIL: file missing: {path}")
+    with open(path, encoding='utf-8') as f:
+        s = f.read()
+    c = s.count(old)
+    if c == 0:
+        return
+    if c != 1:
+        raise SystemExit(f"FAIL: upgrade anchor found {c}x, expected 1, in {rel}: {old[:70]!r}")
+    open(path, 'w', encoding='utf-8').write(s.replace(old, new))
+    report.append(f"== {rel}")
+    report.append(f"  upgraded from an earlier patch version: {old.strip()[:60]!r}")
+    modified.append(rel)
 
 
 # =====================================================================
@@ -225,16 +262,35 @@ patch('index.js', [
 ])
 
 # =====================================================================
-# 3) routes/auth.js  --  allow N users + create JAIL + optional display name
+# 3) routes/auth.js  --  allow N users + create a private JAIL + optional display name
 # =====================================================================
-AUTH_IMPORT_OLD = r"""import express from 'express';
-import bcrypt from 'bcrypt';
-import { userDb } from '../modules/database/index.js';"""
-AUTH_IMPORT_NEW = r"""import express from 'express';
-import fs from 'node:fs';
-import bcrypt from 'bcrypt';
-import { userDb } from '../modules/database/index.js';
-import { computeUserJail } from '../shared/utils.js';"""
+# The one place where a user's folder is born. It is created private, so nothing on the
+# server that runs under another account can read it. Kept as its own pair of constants
+# because upgrade() replays it on a panel patched by an earlier version of this file.
+JAIL_MKDIR_OLD = """            // Create the user's JAIL directory (idempotent) so they have a home to work in.
+            fs.mkdirSync(jail, { recursive: true });
+"""
+JAIL_MKDIR_NEW = """            // Create the user's JAIL directory (idempotent) so they have a home to work in.
+            // 0700 from the first second: no other account on this machine (a bot, another
+            // service) may read what this person works on. chmod repeats the mode because
+            // mkdirSync leaves an already existing folder alone - which is what happens on a
+            // password reset, where the row is deleted and the login registered again.
+            fs.mkdirSync(jail, { recursive: true, mode: 0o700 });
+            fs.chmodSync(jail, 0o700);
+"""
+
+# Two one-line inserts rather than one block of imports: each anchor is a single upstream
+# line that never moves, and each carries its own mark. A file where something else has
+# already added an import of its own (the server-side hardening puts jwt in here) then still
+# patches instead of aborting.
+AUTH_FS_OLD = "import express from 'express';\n"
+AUTH_FS_NEW = "import express from 'express';\nimport fs from 'node:fs';\n"
+AUTH_FS_MARK = "import fs from 'node:fs';"
+
+AUTH_JAIL_IMPORT_OLD = "import { userDb } from '../modules/database/index.js';\n"
+AUTH_JAIL_IMPORT_NEW = ("import { userDb } from '../modules/database/index.js';\n"
+                        "import { computeUserJail } from '../shared/utils.js';\n")
+AUTH_JAIL_IMPORT_MARK = "import { computeUserJail } from '../shared/utils.js';"
 
 AUTH_REG_OLD = r"""        const { username, password } = req.body;
         // Validate input
@@ -284,18 +340,26 @@ AUTH_REG_NEW = r"""        const { username, password, displayName } = req.body;
             const passwordHash = await bcrypt.hash(password, saltRounds);
             // Create user
             const user = userDb.createUser(username, passwordHash);
-            // Create the user's JAIL directory (idempotent) so they have a home to work in.
-            fs.mkdirSync(jail, { recursive: true });
-            // New users skip onboarding: the shared Claude account is already logged in (HOME=/root).
+""" + JAIL_MKDIR_NEW + r"""            // New users skip onboarding: the shared Claude account is already logged in (HOME=/root).
             db.prepare('UPDATE users SET has_completed_onboarding = 1 WHERE id = ?').run(user.id);
             // Optional display name -> git identity (email left empty).
             if (typeof displayName === 'string' && displayName.trim()) {
                 userDb.updateGitConfig(user.id, displayName.trim(), '');
             }"""
 
+# A panel installed before the jail got its 0700 mode carries JAIL_MKDIR_OLD on disk: neither
+# the pristine anchor nor the current text. Lift that piece first, then the replacement below
+# sees the file as fully patched and skips it.
+upgrade('routes/auth.js', JAIL_MKDIR_OLD, JAIL_MKDIR_NEW)
+
+# The registration block keeps growing, so it is matched by a line of ours that does not
+# change (the jail lookup) instead of by the whole block.
+AUTH_REG_MARK = "        const jail = computeUserJail(username);"
+
 patch('routes/auth.js', [
-    (AUTH_IMPORT_OLD, AUTH_IMPORT_NEW, 1),
-    (AUTH_REG_OLD, AUTH_REG_NEW, 1),
+    (AUTH_FS_OLD, AUTH_FS_NEW, 1, AUTH_FS_MARK),
+    (AUTH_JAIL_IMPORT_OLD, AUTH_JAIL_IMPORT_NEW, 1, AUTH_JAIL_IMPORT_MARK),
+    (AUTH_REG_OLD, AUTH_REG_NEW, 1, AUTH_REG_MARK),
 ])
 
 # =====================================================================

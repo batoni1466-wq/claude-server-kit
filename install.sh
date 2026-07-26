@@ -5,6 +5,7 @@
 #   Node 22 + Claude Code CLI + CloudCLI panel + Caddy (HTTPS) + firewall
 #   + all our patches (any-file attachments, terracotta theme, Inter font,
 #     ClaudeCode rebrand, multi-user path-jail isolation, logout button)
+#   + private work folders (0700 per person, nothing else on the box reads them)
 #   + keepalive / creds-sync timers + auto-update lock.
 # It does NOT log into Claude — that is a separate interactive step printed at the
 # end (needs a browser + VPN once). No personal data, no snapshot: every install
@@ -51,7 +52,7 @@ fi
 echo "==> ClaudeCode install"
 echo "    brand=$BRAND  panel=https://$HOST  design=$([ "$ENABLE_DESIGN" = yes ] && echo "https://$DESIGN_HOST" || echo off)"
 
-echo "==> [1/7] Swap + base packages (Node 22, Claude Code, CloudCLI, Caddy, python3)"
+echo "==> [1/8] Swap + base packages (Node 22, Claude Code, CloudCLI, Caddy, python3)"
 export DEBIAN_FRONTEND=noninteractive
 if ! swapon --show | grep -q /swapfile; then
   fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile
@@ -74,19 +75,25 @@ if ! command -v caddy >/dev/null; then
 fi
 echo "    node $(node -v) | claude $(claude --version 2>&1 | head -c 14) | caddy $(caddy version 2>/dev/null | head -c 10)"
 
-echo "==> [2/7] Patch attachments (any file type, up to 20 / 25MB), trim tabs, remove in-UI update"
+echo "==> [2/8] Patch attachments (any file type, up to 20 / 25MB), trim tabs, remove in-UI update"
 python3 "$HERE/patches/patch-attachments.py" "$BASE" >/dev/null && echo "    attachments patched"
 
-echo "==> [3/7] Inter font + terracotta theme + $BRAND rebrand + logout + Design button"
+echo "==> [3/8] Inter font + terracotta theme + $BRAND rebrand + logout + Design button"
 cp "$HERE/patches/InterVariable.woff2" /root/InterVariable.woff2
 cp "$HERE/patches/cc-theme.css"        /root/cc-theme.css
 BRAND="$BRAND" DESIGN_URL="$DESIGN_URL" bash "$HERE/patches/inject-font.sh" "$BASE" /root/InterVariable.woff2 /root/cc-theme.css
 
-echo "==> [4/7] Multi-user path-jail isolation (each login -> own $WORKSPACES_ROOT/<user>)"
+echo "==> [4/8] Private work folders (0700 each, so nothing else on the box reads them)"
+# Deliberately BEFORE the panel patch: closing folders depends on nothing, while the patch
+# aborts on a panel whose sources were already edited by hand. Closing first means a server
+# where the patch fails still ends up with private folders instead of open ones.
 mkdir -p "$WORKSPACES_ROOT"
+WORKSPACES_ROOT="$WORKSPACES_ROOT" bash "$HERE/secure-workspaces.sh"
+
+echo "==> [5/8] Multi-user path-jail isolation (each login -> own $WORKSPACES_ROOT/<user>)"
 python3 "$HERE/patches/patch-multiuser.py" "$BASE" >/dev/null && echo "    multiuser patched"
 
-echo "==> [5/7] Panel service (systemd, root-permission fix IS_SANDBOX=1)"
+echo "==> [6/8] Panel service (systemd, root-permission fix IS_SANDBOX=1)"
 JWT=$(openssl rand -hex 32)
 CLAUDE_BIN=$(command -v claude)
 cat > /etc/systemd/system/cloudcli.service <<EOF
@@ -123,7 +130,7 @@ systemctl daemon-reload
 systemctl enable --now cloudcli >/dev/null 2>&1
 echo "    panel: $(systemctl is-active cloudcli)"
 
-echo "==> [6/7] HTTPS via Caddy"
+echo "==> [7/8] HTTPS via Caddy"
 {
   printf '%s {\n\treverse_proxy 127.0.0.1:3001\n}\n' "$HOST"
   if [ "$ENABLE_DESIGN" = "yes" ]; then
@@ -150,7 +157,7 @@ EOF
 } > /etc/caddy/Caddyfile
 systemctl restart caddy && echo "    caddy: $(systemctl is-active caddy)"
 
-echo "==> [7/7] Firewall (22/80/443 only) + keepalive/creds-sync timers + auto-update lock"
+echo "==> [8/8] Firewall (22/80/443 only) + keepalive/creds-sync timers + auto-update lock"
 ufw allow 22/tcp >/dev/null; ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null
 ufw --force enable >/dev/null 2>&1
 grep -q 'DISABLE_AUTOUPDATER' /etc/environment || echo 'DISABLE_AUTOUPDATER=1' >> /etc/environment
