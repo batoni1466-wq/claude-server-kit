@@ -8,3 +8,7 @@ auth.db
 *.tgz
 __pycache__/
 *.pyc
+
+# Local working copy of the kit: private skills, server addresses, SSH aliases.
+# The kit itself never needs them.
+.claude/
